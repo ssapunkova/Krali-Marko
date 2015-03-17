@@ -5,137 +5,122 @@
 #include <avr/pgmspace.h>
 #include <Wire.h>
 #include <LSM303.h>
-// SONAR
 #include <NewPing.h>
-// SONAR
 
-#define LOG_SERIAL true
-
-/* This example uses the accelerometer in the Zumo Shield's onboard LSM303DLHC with the LSM303 Library to 
- * detect contact with an adversary robot in the sumo ring. The LSM303 Library is not included in the Zumo 
- * Shield libraries; it can be downloaded separately from GitHub at: 
- *
- *    https://github.com/pololu/LSM303 
- *
- * This example extends the BorderDetect example, which makes use of the onboard Zumo Reflectance Sensor Array
- * and its associated library to detect the border of the sumo ring.  It also illustrates the use of the 
- * ZumoMotors, PushButton, and ZumoBuzzer libraries.
- *
- * In loop(), the program reads the x and y components of acceleration (ignoring z), and detects a
- * contact when the magnitude of the 3-period average of the x-y vector exceeds an empirically determined
- * XY_ACCELERATION_THRESHOLD.  On contact detection, the forward speed is increased to FULL_SPEED from
- * the default SEARCH_SPEED, simulating a "fight or flight" response.
- *
- * The program attempts to detect contact only when the Zumo is going straight.  When it is executing a
- * turn at the sumo ring border, the turn itself generates an acceleration in the x-y plane, so the 
- * acceleration reading at that time is difficult to interpret for contact detection.  Since the Zumo also 
- * accelerates forward out of a turn, the acceleration readings are also ignored for MIN_DELAY_AFTER_TURN 
- * milliseconds after completing a turn. To further avoid false positives, a MIN_DELAY_BETWEEN_CONTACTS is 
- * also specified.
- *
- * This example also contains the following enhancements:
+/* 
+ * Copyright (c) 2013 Pololu Corporation.  For more information, see
  * 
- *  - uses the Zumo Buzzer library to play a sound effect ("charge" melody) at start of competition and 
- *    whenever contact is made with an opposing robot
- *
- *  - randomizes the turn angle on border detection, so that the Zumo executes a more effective search pattern
- *
- *  - supports a FULL_SPEED_DURATION_LIMIT, allowing the robot to switch to a SUSTAINED_SPEED after a short 
- *    period of forward movement at FULL_SPEED.  In the example, both speeds are set to 400 (max), but this 
- *    feature may be useful to prevent runoffs at the turns if the sumo ring surface is unusually smooth.
- *
- *  - logging of accelerometer output to the serial monitor when LOG_SERIAL is #defined.
- *
- *  This example also makes use of the public domain RunningAverage library from the Arduino website; the relevant
- *  code has been copied into this .ino file and does not need to be downloaded separately.
+ * http://www.pololu.com/
+ * http://forum.pololu.com/
+ * 
+ * Permission is hereby granted, free of charge, to any person
+ * obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without
+ * restriction, including without limitation the rights to use,
+ * copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following
+ * conditions:
+ * 
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-// #define LOG_SERIAL // write log output to serial port
+#define LOG_SERIAL true // write log output to serial port
 
-#define LED 13
-Pushbutton button(ZUMO_BUTTON); // pushbutton on pin 12
+// ---  --- //
+#define START_LED 13
+Pushbutton start_button(ZUMO_BUTTON); // pushbutton on pin 12
+// ---  --- //
 
-// Accelerometer Settings
-#define RA_SIZE 3  // number of readings to include in running average of accelerometer readings
-#define XY_ACCELERATION_THRESHOLD 2400  // for detection of contact (~16000 = magnitude of acceleration due to gravity)
+// --- ACCELEROMETER --- //
+#define ACCELEROMETER_RA_SIZE 3  // number of readings to include in running average of accelerometer readings
+#define ACCELEROMETER_XY_ACCELERATION_THRESHOLD 2400  // for detection of contact (~16000 = magnitude of acceleration due to gravity)
+// --- ACCELEROMETER --- //
 
-// Reflectance Sensor Settings
-#define NUM_SENSORS 6
-unsigned int sensor_values[NUM_SENSORS];
+// --- REFLECTANCE--- //
+#define REFLECTANCE_NUM_SENSORS 6
+unsigned int reflectance_sensor_values[REFLECTANCE_NUM_SENSORS];
 // this might need to be tuned for different lighting conditions, surfaces, etc.
-#define QTR_THRESHOLD  1500 // microseconds
-ZumoReflectanceSensorArray sensors(QTR_NO_EMITTER_PIN); 
+#define REFLECTANCE_QTR_THRESHOLD  1500 // microseconds
+ZumoReflectanceSensorArray reflectance_sensors(QTR_NO_EMITTER_PIN); 
+// --- REFLECTANCE--- //
 
-// Motor Settings
+// --- MOTOR SETTINGS --- //
 ZumoMotors motors;
 
-// these might need to be tuned for different motor types
-#define REVERSE_SPEED     200 // 0 is stopped, 400 is full speed
-#define TURN_SPEED        200
-#define SEARCH_SPEED      100
-#define SUSTAINED_SPEED   400 // switches to SUSTAINED_SPEED from FULL_SPEED after FULL_SPEED_DURATION_LIMIT ms
-#define FULL_SPEED        400
-#define STOP_DURATION     100 // ms
-#define REVERSE_DURATION  200 // ms
-#define TURN_DURATION     300 // ms
+#define SPEED_REVERSE     200 
+#define SPEED_TURN       200
+#define SPEED_SEARCH      100
+#define SPEED_FULL        400
+#define SPEED_ATTACK      400
 
-#define RIGHT 1
-#define LEFT -1
+#define DURATION_STOP     100 // ms
+#define DURATION_REVERSE  200 // ms
+#define DURATION_TURN     300 // ms
+
+#define DIRECTION_RIGHT 1
+#define DIRECTION_LEFT -1
+// --- MOTOR SETTINGS --- //
 
 enum ForwardSpeed { 
-  SearchSpeed, SustainedSpeed, FullSpeed };
-ForwardSpeed _forwardSpeed;  // current forward speed setting
-unsigned long full_speed_start_time;
-#define FULL_SPEED_DURATION_LIMIT     250  // ms
+  SearchSpeed, FullSpeed, AttackSpeed };
+ForwardSpeed _forwardSpeed;
+// --- STATE --- //
+enum State { 
+  Search, Attack, Defense, RunFromCorners };
+State _state;
+// --- STATE --- //
 
-// Timing
-unsigned long loop_start_time;
-unsigned long last_turn_time;
-unsigned long contact_made_time;
+// --- TIMING --- //
+unsigned long time_loop_start;
+unsigned long time_last_turn;
+unsigned long time_contact_made;
 
 #define MIN_DELAY_AFTER_TURN          400  // ms = min delay before detecting contact event
 #define MIN_DELAY_BETWEEN_CONTACTS   1000  // ms = min delay between detecting new contact event
+// --- TIMING --- //
 
+// --- SONAR --- //
+#define SONAR_TRIGGER_PIN    2  // Arduino pin tied to trigger pin on the ultrasonic sensor.
+#define SONAR_ECHO_PIN       11  // Arduino pin tied to echo pin on the ultrasonic sensor.
+#define SONAR_MAX_DISTANCE   64 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
 
-// SONAR
-#include <NewPing.h>
-
-#define TRIGGER_PIN  2  // Arduino pin tied to trigger pin on the ultrasonic sensor.
-#define ECHO_PIN     11  // Arduino pin tied to echo pin on the ultrasonic sensor.
-#define MAX_DISTANCE 64 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
-
-NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
-
-unsigned int pingSpeed = 50; // How frequently are we going to send out a ping (in milliseconds). 50ms would be 20 times a second.
-unsigned long pingTimer;     // Holds the next ping time.
-// SONAR
-
-// is robot detected //
-boolean is_enemy_detected;
-// is robot detected //
-
+NewPing sonar(SONAR_TRIGGER_PIN, SONAR_ECHO_PIN, SONAR_MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+unsigned int sonar_ping_speed = 50; // How frequently are we going to send out a ping (in milliseconds). 50ms would be 20 times a second.
+unsigned long sonar_ping_timer;     // Holds the next ping time.
+// --- SONAR --- //
 
 // RunningAverage class 
 // based on RunningAverage library for Arduino
 // source:  http://playground.arduino.cc/Main/RunningAverage
 template <typename T> 
 class RunningAverage
-{
-  public:
-    RunningAverage(void);
-    RunningAverage(int);
-    ~RunningAverage();
-    void clear();
-    void addValue(T);
-    T getAverage() const;
-    void fillValue(T, int);
-  protected:
-    int _size;
-    int _cnt;
-    int _idx;
-    T _sum;
-    T * _ar;
-    static T zero;
+{  
+public:
+  RunningAverage(void);
+  RunningAverage(int);
+  ~RunningAverage();
+  void clear();
+  void addValue(T);
+  T getAverage() const;
+  void fillValue(T, int);
+protected:
+  int _size;
+  int _cnt;
+  int _idx;
+  T _sum;
+  T * _ar;
+  static T zero;
 };
 
 // Accelerometer Class -- extends the LSM303 Library to support reading and averaging the x-y acceleration 
@@ -154,7 +139,7 @@ public LSM303
 
 public: 
   Accelerometer() : 
-  ra_x(RA_SIZE), ra_y(RA_SIZE) {
+  ra_x(ACCELEROMETER_RA_SIZE), ra_y(ACCELEROMETER_RA_SIZE) {
   };
   ~Accelerometer() {
   };
@@ -178,6 +163,7 @@ boolean in_contact;  // set when accelerometer detects contact with opposing rob
 
 // forward declaration
 void setForwardSpeed(ForwardSpeed speed);
+void set_state(State state);
 
 void setup()
 {  
@@ -195,11 +181,7 @@ void setup()
 
   randomSeed((unsigned int) millis());
 
-  // uncomment if necessary to correct motor directions
-  //motors.flipLeftMotor(true);
-  //motors.flipRightMotor(true);
-
-  pinMode(LED, HIGH);
+  pinMode(START_LED, HIGH);
   waitForButtonAndCountDown(false);
 }
 
@@ -210,76 +192,62 @@ void waitForButtonAndCountDown(bool restarting)
   Serial.println();
 #endif
 
-  digitalWrite(LED, HIGH);
-  button.waitForButton();
-  digitalWrite(LED, LOW);
+  digitalWrite(START_LED, HIGH);
+  start_button.waitForButton();
+  digitalWrite(START_LED, LOW);
 
-  // play audible countdown
   delay(1000);
 
   // reset loop variables
   in_contact = false;  // 1 if contact made; 0 if no contact or contact lost
-  contact_made_time = 0;
-  last_turn_time = millis();  // prevents false contact detection on initial acceleration
+  time_contact_made = 0;
+  time_last_turn = millis();  // prevents false contact detection on initial acceleration
   _forwardSpeed = SearchSpeed;
-  full_speed_start_time = 0;
   // SONAR
-  is_enemy_detected = false;
-  pingTimer = millis();
+  sonar_ping_timer = millis();
 }
 
 void loop()
 {
-  Serial.print("LOOP!");
-  if (button.isPressed())
+  if (start_button.isPressed())
   {
     // if button is pressed, stop and wait for another press to go again
     motors.setSpeeds(0, 0);
-    button.waitForRelease();
+    start_button.waitForRelease();
     waitForButtonAndCountDown(true);
   }
 
-  loop_start_time = millis();
-  lsm303.readAcceleration(loop_start_time); 
-  sensors.read(sensor_values);
+  time_loop_start = millis();
+  lsm303.readAcceleration(time_loop_start); 
+  reflectance_sensors.read(reflectance_sensor_values);
 
-  //  if ((_forwardSpeed == FullSpeed) && (loop_start_time - full_speed_start_time > FULL_SPEED_DURATION_LIMIT))
-  //  { 
-  //    setForwardSpeed(SustainedSpeed);
-  //  }
-
-  //  // RUN AWAY FROM THE BORDERS!
-  //  if (sensor_values[0] < QTR_THRESHOLD)
-  //  {
-  //    // if leftmost sensor detects line, reverse and turn to the right
-  //    turn(RIGHT, true);
-  //  }
-  //  else if (sensor_values[5] < QTR_THRESHOLD)
-  //  {
-  //    // if rightmost sensor detects line, reverse and turn to the left
-  //    turn(LEFT, true);
-  //  }
-  //  else 
-  //  if (check_for_contact())
-  //  { 
-  //    Serial.println("C+ONTACT!");
-  //    on_contact_made(); // CHECK IF BEING HIT
-  //  }
-  //  else
-  if (scan_for_enemy()) // SCAN FOR ENEMY IN FRONT
+  if (reflectance_sensor_values[0] < REFLECTANCE_QTR_THRESHOLD) // RUN AWAY FROM THE BORDERS!
+  {
+    turn(DIRECTION_RIGHT, true);
+    set_state(RunFromCorners);
+  }
+  else if (reflectance_sensor_values[5] < REFLECTANCE_QTR_THRESHOLD) // RUN AWAY FROM THE BORDERS!
+  {
+    turn(DIRECTION_LEFT, true);
+    set_state(RunFromCorners);
+  }
+  else if (check_for_contact()) // CHECK IF BEING HIT OR HITTING
   { 
-    // attack!
+    on_contact_made(); 
+    set_state(Defense);
+  }
+  else if (scan_for_enemy()) // CHECK FOR ENEMY IN FRONT
+  { 
     on_attack(); // ATTACK!
+    set_state(Attack);
   } 
   else
   {
-    Serial.println("LOOK AROUND!");
     look_around(); // LOOK AROUND
+    set_state(Search);
   }  
 }
 
-boolean in_attack;
-////////////// TODO
 void on_attack()
 {
 #ifdef LOG_SERIAL
@@ -287,29 +255,17 @@ void on_attack()
   Serial.println();
 #endif
 
-
-  // in_attack = true;
-  setForwardSpeed(FullSpeed);
-  //contact_made_time = loop_start_time;
+  setForwardSpeed(AttackSpeed);
   int speed = getForwardSpeed();
   motors.setSpeeds(speed, speed);
+  set_state(Attack);
 }
 
-// SEARCH
 boolean scan_for_enemy(){
-  return sonar_ping();
-}
-// SEARCH
-
-// SONAR
-boolean sonar_ping(){
-  Serial.println("sonar_ping()");
-  if (millis() >= pingTimer) {   // pingSpeed milliseconds since last ping, do another ping.
-    pingTimer += pingSpeed;      // Set the next ping time.
-    //  sonar.ping_timer(_sonar_check); // Send out the ping, calls "_sonar_check" function every 24uS where you can check the ping status.
+  if (millis() >= sonar_ping_timer) {   // pingSpeed milliseconds since last ping, do another ping.
+    sonar_ping_timer += sonar_ping_speed;      // Set the next ping time.
     sonar.ping();
     if (sonar.check_timer()) { // This is how you check to see if the ping was received.
-      Serial.println("ENEMY DETECTED!!");
       unsigned int distance = sonar.ping_result / US_ROUNDTRIP_CM;
 #ifdef LOG_SERIAL
       Serial.print("Ping: ");
@@ -325,24 +281,22 @@ boolean sonar_ping(){
 boolean _is_object_detected(unsigned int distance){
 #ifdef LOG_SERIAL
   Serial.print("Object detected: ");
-  Serial.print(MAX_DISTANCE >= distance); // Ping returned, uS result in ping_result, convert to cm with US_ROUNDTRIP_CM.
+  Serial.print(SONAR_MAX_DISTANCE >= distance); // Ping returned, uS result in ping_result, convert to cm with US_ROUNDTRIP_CM.
   Serial.println();
 #endif
 
-  return (MAX_DISTANCE >= distance);
+  return (SONAR_MAX_DISTANCE >= distance);
 } 
 // SONAR
 
-void look_around(){
+void look_around()
+{
 #ifdef LOG_SERIAL
   Serial.print("looking around ...");
   Serial.println();
 #endif
-
-  // assume contact lost
-  on_contact_lost();
   setForwardSpeed(SearchSpeed);
-  motors.setSpeeds(SEARCH_SPEED * -1, -SEARCH_SPEED * -1);
+  motors.setSpeeds(SPEED_SEARCH * -1, -SPEED_SEARCH * -1);
   delay(50);
 }
 
@@ -359,23 +313,19 @@ void turn(char direction, bool randomize)
   // assume contact lost
   on_contact_lost();
 
-  static unsigned int duration_increment = TURN_DURATION / 4;
-
-  // motors.setSpeeds(0,0);
-  // delay(STOP_DURATION);
-  motors.setSpeeds(-REVERSE_SPEED, -REVERSE_SPEED);
-  delay(REVERSE_DURATION);
-  motors.setSpeeds(TURN_SPEED * direction, -TURN_SPEED * direction);
-  delay(randomize ? TURN_DURATION + (random(8) - 2) * duration_increment : TURN_DURATION);
+  static unsigned int duration_increment = DURATION_TURN / 4;
+  motors.setSpeeds(-SPEED_REVERSE, -SPEED_REVERSE);
+  delay(DURATION_REVERSE);
+  motors.setSpeeds(SPEED_TURN * direction, -SPEED_TURN * direction);
+  delay(randomize ? DURATION_TURN + (random(8) - 2) * duration_increment : DURATION_TURN);
   int speed = getForwardSpeed();
   motors.setSpeeds(speed, speed);
-  last_turn_time = millis();
+  time_last_turn = millis();
 }
 
 void setForwardSpeed(ForwardSpeed speed)
 {
   _forwardSpeed = speed;
-  if (speed == FullSpeed) full_speed_start_time = loop_start_time;
 }
 
 int getForwardSpeed()
@@ -384,29 +334,32 @@ int getForwardSpeed()
   switch (_forwardSpeed)
   {
   case FullSpeed:
-    speed = FULL_SPEED;
+    speed = SPEED_FULL;
     break;
-  case SustainedSpeed:
-    speed = SUSTAINED_SPEED;
+  case AttackSpeed:
+    speed = SPEED_ATTACK;
     break;
   default:
-    speed = SEARCH_SPEED;
+    speed = SPEED_SEARCH;
     break;
   }
   return speed;
 }
 
+void set_state(State state){
+
+}
+
 // check for contact, but ignore readings immediately after turning or losing contact
 boolean check_for_contact()
 {
-  //Serial.println("CHECK FOR CONTACT");
-  static long threshold_squared = (long) XY_ACCELERATION_THRESHOLD * (long) XY_ACCELERATION_THRESHOLD;
+  static long threshold_squared = (long) ACCELEROMETER_XY_ACCELERATION_THRESHOLD * (long) ACCELEROMETER_XY_ACCELERATION_THRESHOLD;
   return (lsm303.ss_xy_avg() >  threshold_squared) && \
-    (loop_start_time - last_turn_time > MIN_DELAY_AFTER_TURN) && \
-    (loop_start_time - contact_made_time > MIN_DELAY_BETWEEN_CONTACTS);
+    (time_loop_start - time_last_turn > MIN_DELAY_AFTER_TURN) && \
+    (time_loop_start - time_contact_made > MIN_DELAY_BETWEEN_CONTACTS);
 }
 
-// sound horn and accelerate on contact -- fight or flight
+// accelerate on contact -- fight or flight
 void on_contact_made()
 {
 #ifdef LOG_SERIAL
@@ -414,7 +367,7 @@ void on_contact_made()
   Serial.println();
 #endif
   in_contact = true;
-  contact_made_time = loop_start_time;
+  time_contact_made = time_loop_start;
   setForwardSpeed(FullSpeed);
 }
 
@@ -579,5 +532,7 @@ void RunningAverage<T>::fillValue(T value, int number)
     addValue(value);
   }
 }
+
+
 
 
